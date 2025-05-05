@@ -1,0 +1,2 @@
+kafka-python # Thư viện Kafka client cho Python
+Faker        # Thư viện tạo dữ liệu giả lập

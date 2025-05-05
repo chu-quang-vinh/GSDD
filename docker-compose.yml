@@ -1,0 +1,185 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0 # Hoặc phiên bản mới hơn
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - fraud_detection_net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0 # Cùng phiên bản với zookeeper
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092" # Port cho client bên ngoài (như data generator từ host nếu không chạy trong docker)
+      - "9093:9093" # Port cho giao tiếp nội bộ giữa các container
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:9093 # localhost cho host, kafka cho container khác
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    networks:
+      - fraud_detection_net
+
+  # Service để tạo topic tự động (tùy chọn, có thể tạo thủ công)
+  init-kafka:
+      image: confluentinc/cp-kafka:7.3.0
+      depends_on:
+        - kafka
+      container_name: init-kafka
+      command: >
+        bash -c "
+          echo 'Chờ Kafka sẵn sàng...' && \
+          cub kafka-ready -b kafka:9093 1 30 && \
+          echo 'Kafka đã sẵn sàng!' && \
+          kafka-topics --create --topic transactions --bootstrap-server kafka:9093 --partitions 1 --replication-factor 1
+        "
+      networks:
+        - fraud_detection_net
+
+  spark-master:
+    image: bitnami/spark:3.4 # Chọn phiên bản Spark phù hợp
+    container_name: spark-master
+    command: bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "8080:8080" # Spark Master UI
+      - "7077:7077" # Spark Master Port
+    volumes:
+      - ./spark_processor:/opt/bitnami/spark/app # Mount thư mục chứa script xử lý
+    networks:
+      - fraud_detection_net
+
+  spark-worker:
+    image: bitnami/spark:3.4 # Cùng phiên bản với master
+    container_name: spark-worker
+    command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: 2 # Số core ảo cho worker
+      SPARK_WORKER_MEMORY: 1g # RAM cho worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+    volumes:
+      - ./spark_processor:/opt/bitnami/spark/app # Mount thư mục chứa script xử lý
+    networks:
+      - fraud_detection_net
+
+  postgres:
+    image: postgres:14 # Hoặc phiên bản bạn muốn
+    container_name: postgres_db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: fraud_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - fraud_detection_net
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.9 # Chọn version tương thích Spark và Grafana
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m # Giới hạn RAM cho ES
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - fraud_detection_net
+
+  grafana:
+    image: grafana/grafana:11.4.0 # Hoặc phiên bản mới hơn
+    container_name: grafana
+    depends_on:
+      - elasticsearch
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Bạn có thể mount file provisioning để tự động cấu hình datasource/dashboard
+      # - ./grafana_provisioning/:/etc/grafana/provisioning/
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin # Đặt mật khẩu admin
+    networks:
+      - fraud_detection_net
+
+  data-generator:
+    build: ./data_generator # Build từ Dockerfile trong thư mục data_generator
+    container_name: data_generator
+    depends_on:
+      - kafka
+      - init-kafka # Đảm bảo topic đã được tạo trước khi chạy generator
+    networks:
+      - fraud_detection_net
+    # restart: on-failure # Tự khởi động lại nếu lỗi
+  spark-submit:
+    image: bitnami/spark:3.4
+    container_name: spark-submit
+    depends_on:
+      - spark-master
+      - kafka
+      - elasticsearch
+      - init-elasticsearch  
+    command: |
+      bash -c '
+        echo "Chờ các dịch vụ khởi động..." &&
+        sleep 30 &&
+        echo "Sửa line endings..." &&
+        sed -i "s/\r$//" /opt/bitnami/spark/app/process_stream.py &&
+        chmod +x /opt/bitnami/spark/app/process_stream.py &&
+        echo "Bắt đầu chạy Spark job..." &&
+        /opt/bitnami/spark/bin/spark-submit --master spark://spark-master:7077 --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0,org.elasticsearch:elasticsearch-spark-30_2.12:7.17.9 --conf spark.executor.extraJavaOptions=-Dlog4j.configuration=file:/opt/bitnami/spark/conf/log4j.properties /opt/bitnami/spark/app/process_stream.py
+      '
+    volumes:
+      - ./spark_processor:/opt/bitnami/spark/app
+    networks:
+      - fraud_detection_net
+  init-elasticsearch:
+    image: curlimages/curl:latest
+    container_name: init-elasticsearch
+    depends_on:
+        - elasticsearch
+    command: |
+        sh -c '
+          echo "Đợi Elasticsearch khởi động..." &&
+          sleep 20 &&
+          echo "Kiểm tra Elasticsearch đã sẵn sàng chưa..." &&
+          until curl -s "elasticsearch:9200" > /dev/null; do
+            sleep 5
+            echo "Đang đợi Elasticsearch..."
+          done &&
+          echo "Elasticsearch đã sẵn sàng!" &&
+          echo "Xóa index cũ nếu tồn tại..." &&
+          curl -X DELETE "elasticsearch:9200/transactions_index" || true &&
+          echo "Tạo index mới với mapping đúng..." &&
+          curl -X PUT "elasticsearch:9200/transactions_index" -H "Content-Type: application/json" -d'\''{"mappings":{"properties":{"@timestamp":{"type":"date","format":"epoch_millis||yyyy-MM-dd HH:mm:ss"},"transaction_id":{"type":"keyword"},"user_id":{"type":"long"},"amount":{"type":"float"},"currency":{"type":"keyword"},"timestamp":{"type":"long"},"location":{"type":"keyword"},"merchant_id":{"type":"long"},"is_suspicious_rule":{"type":"boolean"}}}}'\'' &&
+          echo "Kiểm tra mapping đã được áp dụng chưa:" &&
+          curl -X GET "elasticsearch:9200/transactions_index/_mapping?pretty"
+        '
+    networks:
+        - fraud_detection_net
+volumes:
+  postgres_data:
+  es_data:
+  grafana_data:
+
+networks:
+  fraud_detection_net:
+    driver: bridge
